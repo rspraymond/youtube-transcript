@@ -71,38 +71,53 @@ export class YoutubeTranscript {
     config?: TranscriptConfig
   ): Promise<TranscriptResponse[]> {
     const identifier = this.retrieveVideoId(videoId);
-    const videoPageResponse = await fetch(
-      `https://www.youtube.com/watch?v=${identifier}`,
-      {
-        headers: {
-          ...(config?.lang && { 'Accept-Language': config.lang }),
-          'User-Agent': USER_AGENT,
-        },
-      }
-    );
-    const videoPageBody = await videoPageResponse.text();
+    
+        // Try HTML parsing first (original battle-tested method)
+    let captions;
+    try {
+      const videoPageResponse = await fetch(
+        `https://www.youtube.com/watch?v=${identifier}`,
+        {
+          headers: {
+            ...(config?.lang && { 'Accept-Language': config.lang }),
+            'User-Agent': USER_AGENT,
+          },
+        }
+      );
+      const videoPageBody = await videoPageResponse.text();
 
-    const splittedHTML = videoPageBody.split('"captions":');
+      const splittedHTML = videoPageBody.split('"captions":');
 
-    if (splittedHTML.length <= 1) {
-      if (videoPageBody.includes('class="g-recaptcha"')) {
-        throw new YoutubeTranscriptTooManyRequestError();
+      if (splittedHTML.length <= 1) {
+        if (videoPageBody.includes('class="g-recaptcha"')) {
+          throw new YoutubeTranscriptTooManyRequestError();
+        }
+        if (!videoPageBody.includes('"playabilityStatus":')) {
+          throw new YoutubeTranscriptVideoUnavailableError(videoId);
+        }
+        throw new YoutubeTranscriptDisabledError(videoId);
       }
-      if (!videoPageBody.includes('"playabilityStatus":')) {
-        throw new YoutubeTranscriptVideoUnavailableError(videoId);
-      }
-      throw new YoutubeTranscriptDisabledError(videoId);
+
+      captions = (() => {
+        try {
+          return JSON.parse(
+            splittedHTML[1].split(',"videoDetails')[0].replace('\n', '')
+          );
+        } catch (e) {
+          // Fallback: use regex to extract captions object
+          const altMatch = videoPageBody.match(/"captions":\s*({[^}]+})/);
+          if (altMatch) {
+            return JSON.parse(altMatch[1]);
+          }
+          return undefined;
+        }
+      })()?.['playerCaptionsTracklistRenderer'];
+    } catch (e) {
+      // HTML parsing failed completely, will try InnerTube API fallback
+      captions = null;
     }
 
-    const captions = (() => {
-      try {
-        return JSON.parse(
-          splittedHTML[1].split(',"videoDetails')[0].replace('\n', '')
-        );
-      } catch (e) {
-        return undefined;
-      }
-    })()?.['playerCaptionsTracklistRenderer'];
+
 
     if (!captions) {
       throw new YoutubeTranscriptDisabledError(videoId);
@@ -143,6 +158,74 @@ export class YoutubeTranscript {
       throw new YoutubeTranscriptNotAvailableError(videoId);
     }
     const transcriptBody = await transcriptResponse.text();
+    
+    // If transcript body is empty, the HTML parsing method failed (YouTube security update)
+    // Try InnerTube API as fallback
+    if (transcriptBody.length === 0) {
+      try {
+        const InnerTubeApiResponse = await fetch(
+          'https://www.youtube.com/youtubei/v1/player',
+          {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'User-Agent': USER_AGENT,
+              'Referer': `https://www.youtube.com/watch?v=${identifier}`,
+              'Origin': 'https://www.youtube.com',
+            },
+            body: JSON.stringify({
+              context: {
+                client: {
+                  clientName: 'WEB',
+                  clientVersion: '2.20241211.01.00',
+                },
+              },
+              videoId: identifier,
+            }),
+          }
+        );
+        
+        if (InnerTubeApiResponse.ok) {
+          const innerTubeData = await InnerTubeApiResponse.json();
+          const innerTubeCaptions = innerTubeData?.captions?.playerCaptionsTracklistRenderer;
+          
+          if (innerTubeCaptions && innerTubeCaptions.captionTracks) {
+            const innerTubeTranscriptURL = (
+              config?.lang
+                ? innerTubeCaptions.captionTracks.find(
+                    (track) => track.languageCode === config?.lang
+                  )
+                : innerTubeCaptions.captionTracks[0]
+            ).baseUrl;
+            
+            const innerTubeTranscriptResponse = await fetch(innerTubeTranscriptURL, {
+              headers: {
+                ...(config?.lang && { 'Accept-Language': config.lang }),
+                'User-Agent': USER_AGENT,
+                'Referer': `https://www.youtube.com/watch?v=${identifier}`,
+              },
+            });
+            
+            if (innerTubeTranscriptResponse.ok) {
+              const innerTubeTranscriptBody = await innerTubeTranscriptResponse.text();
+              if (innerTubeTranscriptBody.length > 0) {
+                const results = [...innerTubeTranscriptBody.matchAll(RE_XML_TRANSCRIPT)];
+                return results.map((result) => ({
+                  text: result[3],
+                  duration: parseFloat(result[2]),
+                  offset: parseFloat(result[1]),
+                  lang: config?.lang ?? innerTubeCaptions.captionTracks[0].languageCode,
+                }));
+              }
+            }
+          }
+        }
+      } catch (e) {
+        // InnerTube fallback failed, continue with original error
+      }
+      throw new YoutubeTranscriptNotAvailableError(videoId);
+    }
+    
     const results = [...transcriptBody.matchAll(RE_XML_TRANSCRIPT)];
     return results.map((result) => ({
       text: result[3],
